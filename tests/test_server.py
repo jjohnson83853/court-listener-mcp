@@ -3,10 +3,10 @@
 import asyncio
 from typing import Any
 
+import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from loguru import logger
-import pytest
 
 
 @pytest.mark.asyncio
@@ -27,7 +27,7 @@ async def test_status_tool(client: Client[Any]) -> None:
         # Verify expected fields
         assert data["status"] == "healthy"
         assert data["service"] == "CourtListener MCP Server"
-        assert data["version"] == "0.1.0"
+        assert data["version"] == "0.2.0"
         assert "timestamp" in data
         assert "environment" in data
         assert "system" in data
@@ -111,6 +111,7 @@ async def test_imported_get_tools_available(client: Client[Any]) -> None:
         logger.info(f"Found {len(expected_get_tools)} get tools with correct prefixes")
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_search_opinions_tool(client: Client[Any]) -> None:
     """Test the search opinions tool with real API call.
@@ -147,6 +148,7 @@ async def test_search_opinions_tool(client: Client[Any]) -> None:
         logger.info(f"Search opinions returned {data['count']} total results")
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_get_court_tool(client: Client[Any]) -> None:
     """Test the get court tool with a known court ID.
@@ -171,6 +173,7 @@ async def test_get_court_tool(client: Client[Any]) -> None:
         logger.info(f"Retrieved court info: {data.get('full_name', 'Unknown')}")
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_search_with_date_filters(client: Client[Any]) -> None:
     """Test search with date range filters.
@@ -208,6 +211,7 @@ async def test_search_with_date_filters(client: Client[Any]) -> None:
         logger.info(f"Date filtered search returned {len(data['results'])} results")
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_error_handling(client: Client[Any]) -> None:
     """Test error handling for invalid requests.
@@ -255,6 +259,7 @@ async def test_tool_descriptions(client: Client[Any]) -> None:
         logger.info(f"All {len(tools)} tools have proper descriptions and schemas")
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_search_people_tool(client: Client[Any]) -> None:
     """Test searching for judges/people in the database.
@@ -291,6 +296,7 @@ async def test_search_people_tool(client: Client[Any]) -> None:
         logger.info(f"People search found {data['count']} judges named Roberts")
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_concurrent_requests(client: Client[Any]) -> None:
     """Test that the server handles concurrent requests properly.

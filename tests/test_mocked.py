@@ -4,14 +4,14 @@ These tests use respx to mock HTTP responses, avoiding real API calls.
 This enables testing error paths and edge cases reliably.
 """
 
+import json
 from typing import Any
 
-from fastmcp import Client
-from fastmcp.exceptions import ToolError
 import httpx
 import pytest
 import respx
-
+from fastmcp import Client
+from fastmcp.exceptions import ToolError
 
 # Sample mock responses
 MOCK_OPINIONS_RESPONSE = {
@@ -70,6 +70,31 @@ MOCK_OPINION_RESPONSE = {
     "html": "<p>This is the opinion text...</p>",
 }
 
+MOCK_CLUSTER_DETAIL_RESPONSE = {
+    "id": 123,
+    "case_name": "Smith v. Jones",
+    "case_name_full": "Smith et al. v. Jones et al.",
+    "docket": "https://www.courtlistener.com/api/rest/v4/dockets/55/",
+    "court": "scotus",
+    "date_filed": "2023-06-15",
+    "citations": [{"cite": "123 U.S. 456", "type": "official"}],
+    "absolute_url": "/opinion/123/smith-v-jones/",
+    "panel_ids": [1, 2],
+    "judges": "Smith J.",
+    "sha1": "abc123",
+    "local_path": "/data/cluster/123",
+}
+
+
+class _FakeClock:
+    """Deterministic time.time replacement for TTL tests."""
+
+    def __init__(self, start: float) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
 MOCK_CITATION_LOOKUP_RESPONSE = [
     {
         "id": 123456,
@@ -118,7 +143,8 @@ class TestMockedSearchTools:
             assert not result.is_error
             data = result.data
             assert data["count"] == 1
-            assert data["results"][0]["case_name"] == "Patent Corp v. Tech Inc"
+            assert data["results"][0]["caseName"] == "Patent Corp v. Tech Inc"
+            assert data["results"][0]["docketNumber"] == "23-1234"
 
     @pytest.mark.asyncio
     @respx.mock
@@ -138,6 +164,239 @@ class TestMockedSearchTools:
             data = result.data
             assert data["count"] == 0
             assert len(data["results"]) == 0
+
+
+class TestSnippetSearch:
+    """Snippet-only search behavior (FR-2, ADR-5, D2)."""
+
+    @pytest.mark.asyncio
+    async def test_ac_6_1_search_docstrings_have_worked_examples(
+        self, client: Client[Any]
+    ) -> None:
+        """AC-6.1: every search tool's docstring contains a worked typed-param example."""
+        async with client:
+            tools = await client.list_tools()
+
+        search_tools = [tool for tool in tools if tool.name.startswith("search_")]
+        assert len(search_tools) >= 7  # opinions, dockets, r, rd, NL, audio, people
+        for tool in search_tools:
+            description = (tool.description or "").lower()
+            assert "example" in description, f"{tool.name} missing worked example"
+            # A typed-param example, not just prose: q=/court=/judge=/query=.
+            assert any(
+                marker in description for marker in ("q=", "court=", "judge=", "query=")
+            ), tool.name
+
+    @pytest.mark.asyncio
+    async def test_ac_3_3_include_all_fields_is_real_parameter_default(self) -> None:
+        """Checklist (d): include_all_fields has a real False default in the tool signature."""
+        import inspect
+
+        from app.tools.get import cluster, docket, opinion
+
+        for tool_fn in (opinion, cluster, docket):
+            signature = inspect.signature(tool_fn)
+            assert "include_all_fields" in signature.parameters
+            assert signature.parameters["include_all_fields"].default is False
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_review_high_2_unwritable_cache_still_returns_data(
+        self, client: Client[Any], tmp_path: Any
+    ) -> None:
+        """HIGH-2 fix: an unwritable cache dir never turns a good fetch into an error."""
+        from app.cache import FileCache, set_cache
+
+        root = tmp_path / "blocked-cache"
+        root.mkdir()
+        # A FILE where the clusters/ namespace dir must be → every put() raises OSError.
+        (root / "clusters").write_text("not a directory", encoding="utf-8")
+        set_cache(FileCache(root=root))
+        try:
+            route = respx.get(
+                "https://www.courtlistener.com/api/rest/v4/clusters/123/"
+            ).mock(return_value=httpx.Response(200, json=MOCK_CLUSTER_DETAIL_RESPONSE))
+
+            async with client:
+                result = await client.call_tool("get_cluster", {"cluster_id": "123"})
+
+            assert not result.is_error
+            assert result.data["caseName"] == "Smith v. Jones"
+            assert route.call_count == 1  # the API fetch itself succeeded
+        finally:
+            set_cache(None)
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_review_court_fallback_via_cached_docket(
+        self, client: Client[Any], tmp_path: Any
+    ) -> None:
+        """T4 court rule (R1): cluster without court → court via cached docket fetch."""
+        from app.cache import get_cache
+
+        cluster_no_court = dict(MOCK_CLUSTER_DETAIL_RESPONSE)
+        del cluster_no_court["court"]
+        cluster_route = respx.get(
+            "https://www.courtlistener.com/api/rest/v4/clusters/123/"
+        ).mock(return_value=httpx.Response(200, json=cluster_no_court))
+        docket_route = respx.get(
+            "https://www.courtlistener.com/api/rest/v4/dockets/55/"
+        ).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": 55,
+                    "case_name": "Smith v. Jones",
+                    "court": "https://www.courtlistener.com/api/rest/v4/courts/dcd/",
+                },
+            )
+        )
+
+        async with client:
+            first = await client.call_tool("get_cluster", {"cluster_id": "123"})
+            second = await client.call_tool("get_cluster", {"cluster_id": "123"})
+
+        assert not first.is_error and not second.is_error
+        assert first.data["court"] == "dcd"
+        assert second.data["court"] == "dcd"
+        assert cluster_route.call_count == 1
+        assert docket_route.call_count == 1  # second call: court served from cache
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_review_court_fallback_docket_failure_is_not_fatal(
+        self, client: Client[Any]
+    ) -> None:
+        """T4 court rule (R1): a failed docket fetch never fails the tool call."""
+        cluster_no_court = dict(MOCK_CLUSTER_DETAIL_RESPONSE)
+        del cluster_no_court["court"]
+        respx.get(
+            "https://www.courtlistener.com/api/rest/v4/clusters/123/"
+        ).mock(return_value=httpx.Response(200, json=cluster_no_court))
+        respx.get(
+            "https://www.courtlistener.com/api/rest/v4/dockets/55/"
+        ).mock(return_value=httpx.Response(500, json={"detail": "boom"}))
+
+        async with client:
+            result = await client.call_tool("get_cluster", {"cluster_id": "123"})
+
+        assert not result.is_error  # enrichment is best-effort, never fatal
+        assert "court" not in result.data  # failed enrichment → court omitted
+        assert result.data["caseName"] == "Smith v. Jones"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_ac_2_2_default_limit_is_10(self, client: Client[Any]) -> None:
+        """AC-2.2: a default-limit opinions call sends hit=10 to the API."""
+        route = respx.get("https://www.courtlistener.com/api/rest/v4/search/").mock(
+            return_value=httpx.Response(200, json=MOCK_OPINIONS_RESPONSE)
+        )
+
+        async with client:
+            result = await client.call_tool("search_opinions", {"q": "miranda"})
+
+            assert not result.is_error
+            assert route.calls.last.request.url.params["hit"] == "10"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_ac_2_2_signature_default_10_cap_50(self, client: Client[Any]) -> None:
+        """AC-2.2: the four search tools default to 10 with an explicit 1-50 cap."""
+        async with client:
+            tools = await client.list_tools()
+
+        schemas = {tool.name: tool.inputSchema for tool in tools}
+        for name in (
+            "search_opinions",
+            "search_dockets",
+            "search_dockets_with_documents",
+            "search_recap_documents",
+        ):
+            limit_schema = schemas[name]["properties"]["limit"]
+            assert limit_schema.get("default") == 10, name
+            assert limit_schema.get("maximum") == 50, name
+            assert limit_schema.get("minimum") == 1, name
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_ac_2_3_highlight_sent_per_type(self, client: Client[Any]) -> None:
+        """AC-2.3: highlight=on for o/r/rd; absent for d."""
+        respx.get("https://www.courtlistener.com/api/rest/v4/search/").mock(
+            return_value=httpx.Response(200, json=MOCK_OPINIONS_RESPONSE)
+        )
+
+        async with client:
+            await client.call_tool("search_opinions", {"q": "x"})
+            assert (
+                respx.calls.last.request.url.params.get("highlight") == "on"
+            )
+            await client.call_tool("search_dockets", {"q": "x"})
+            assert respx.calls.last.request.url.params.get("highlight") is None
+            await client.call_tool("search_dockets_with_documents", {"q": "x"})
+            assert respx.calls.last.request.url.params.get("highlight") == "on"
+            await client.call_tool("search_recap_documents", {"q": "x"})
+            assert respx.calls.last.request.url.params.get("highlight") == "on"
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_ac_2_4_search_payload_reduction(self, client: Client[Any]) -> None:
+        """AC-2.4: stripped search envelope < 0.5 * raw response size."""
+        verbose_response = {
+            "count": 1,
+            "next": "https://www.courtlistener.com/api/rest/v4/search/?cursor=abc",
+            "previous": None,
+            "results": [
+                {
+                    "id": 1000,
+                    "caseName": "Smith v. Jones",
+                    "dateFiled": "2023-06-15",
+                    "court": "ca9",
+                    "court_id": "ca9",
+                    "citation": ["123 F.3d 456"],
+                    "cluster_id": 123,
+                    "docket_id": 55,
+                    "docketNumber": "23-1234",
+                    "status": "Precedential",
+                    "judge": "Smith J.",
+                    "citeCount": 42,
+                    "absolute_url": "/opinion/123/smith-v-jones/",
+                    "score": 0.95,
+                    "snippet": "the doctrine applies",
+                    "opinions": [{"id": 1, "snippet": "the doctrine applies"}],
+                    "meta": {"scoring": "bm25", "debug": "x" * 200},
+                    "cited_blocks": ["x" * 300],
+                }
+            ],
+        }
+        respx.get("https://www.courtlistener.com/api/rest/v4/search/").mock(
+            return_value=httpx.Response(200, json=verbose_response)
+        )
+
+        async with client:
+            result = await client.call_tool("search_opinions", {"q": "doctrine"})
+
+        assert not result.is_error
+        assert len(json.dumps(result.data)) < 0.5 * len(json.dumps(verbose_response))
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_oa_and_people_search_stay_raw(self, client: Client[Any]) -> None:
+        """Non-goals: audio (oa) and people (p) searches are raw pass-throughs."""
+        raw_audio = {
+            "count": 1,
+            "next": None,
+            "previous": None,
+            "results": [{"id": 7, "case_name": "Arg", "download_url": "x.mp3"}],
+        }
+        respx.get("https://www.courtlistener.com/api/rest/v4/search/").mock(
+            return_value=httpx.Response(200, json=raw_audio)
+        )
+
+        async with client:
+            result = await client.call_tool("search_audio", {"q": "argument"})
+
+            assert not result.is_error
+            assert result.data["results"][0]["case_name"] == "Arg"
 
 
 class TestMockedGetTools:
@@ -162,9 +421,12 @@ class TestMockedGetTools:
     @pytest.mark.asyncio
     @respx.mock
     async def test_get_opinion_success(self, client: Client[Any]) -> None:
-        """Test successful opinion retrieval with mocked response."""
+        """Test opinion retrieval: stripped FR-3.1 output with joined cluster (ADR-4)."""
         respx.get("https://www.courtlistener.com/api/rest/v4/opinions/123456/").mock(
             return_value=httpx.Response(200, json=MOCK_OPINION_RESPONSE)
+        )
+        respx.get("https://www.courtlistener.com/api/rest/v4/clusters/123/").mock(
+            return_value=httpx.Response(200, json=MOCK_CLUSTER_DETAIL_RESPONSE)
         )
 
         async with client:
@@ -172,8 +434,153 @@ class TestMockedGetTools:
 
             assert not result.is_error
             data = result.data
-            assert data["id"] == 123456
-            assert "plain_text" in data
+            assert set(data.keys()) <= {
+                "caseName",
+                "citations",
+                "court",
+                "dateFiled",
+                "opinionText",
+                "cluster_id",
+                "docket_id",
+            }
+            assert data["opinionText"] == "This is the opinion text..."
+            assert data["caseName"] == "Smith v. Jones"
+            assert data["cluster_id"] == 123
+            assert data["dateFiled"] == "2023-06-15"
+            # HIGH-1: docket_id extracted from the joined cluster's docket URL.
+            assert data["docket_id"] == 55
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_ac_4_1_cluster_second_call_zero_http(
+        self, client: Client[Any]
+    ) -> None:
+        """AC-4.1: two consecutive cluster calls for one ID → exactly 1 HTTP request."""
+        route = respx.get("https://www.courtlistener.com/api/rest/v4/clusters/123/").mock(
+            return_value=httpx.Response(200, json=MOCK_CLUSTER_DETAIL_RESPONSE)
+        )
+
+        async with client:
+            for _ in range(2):
+                result = await client.call_tool("get_cluster", {"cluster_id": "123"})
+                assert not result.is_error
+
+        assert route.call_count == 1
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_ac_4_1_opinion_second_call_zero_new_http(
+        self, client: Client[Any]
+    ) -> None:
+        """AC-4.1: opinion (+ its cluster join) fetched once, then cached."""
+        opinion_route = respx.get(
+            "https://www.courtlistener.com/api/rest/v4/opinions/123456/"
+        ).mock(return_value=httpx.Response(200, json=MOCK_OPINION_RESPONSE))
+        cluster_route = respx.get(
+            "https://www.courtlistener.com/api/rest/v4/clusters/123/"
+        ).mock(return_value=httpx.Response(200, json=MOCK_CLUSTER_DETAIL_RESPONSE))
+
+        async with client:
+            first = await client.call_tool("get_opinion", {"opinion_id": "123456"})
+            second = await client.call_tool("get_opinion", {"opinion_id": "123456"})
+
+        assert not first.is_error and not second.is_error
+        # 1 opinion fetch + 1 cluster fetch total; second call fully cached.
+        assert opinion_route.call_count == 1
+        assert cluster_route.call_count == 1
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_include_all_fields_opt_out_returns_raw(
+        self, client: Client[Any]
+    ) -> None:
+        """D4/FR-3.3: include_all_fields=true returns the raw cached payload."""
+        respx.get("https://www.courtlistener.com/api/rest/v4/clusters/123/").mock(
+            return_value=httpx.Response(200, json=MOCK_CLUSTER_DETAIL_RESPONSE)
+        )
+
+        async with client:
+            result = await client.call_tool(
+                "get_cluster", {"cluster_id": "123", "include_all_fields": True}
+            )
+
+            assert not result.is_error
+            data = result.data
+            # Raw payload: junk fields intact, no stripping.
+            assert data["id"] == 123
+            assert "absolute_url" in data
+            assert "case_name" in data
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_ac_4_2_cache_files_under_expected_paths(
+        self, client: Client[Any]
+    ) -> None:
+        """AC-4.2: a cluster get writes clusters/cluster-<id>.json."""
+        from app.cache import get_cache
+
+        respx.get("https://www.courtlistener.com/api/rest/v4/clusters/123/").mock(
+            return_value=httpx.Response(200, json=MOCK_CLUSTER_DETAIL_RESPONSE)
+        )
+
+        async with client:
+            await client.call_tool("get_cluster", {"cluster_id": "123"})
+
+        cache = get_cache()
+        assert (cache.root / "clusters" / "cluster-123.json").is_file()
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_ac_4_3_expired_entry_triggers_fresh_http(
+        self,
+        client: Client[Any],
+        tmp_path: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """AC-4.3: past TTL the cached entry misses → fresh HTTP call."""
+        import app.cache as cache_module
+        from app.cache import FileCache, set_cache
+
+        fake_time = _FakeClock(1_000_000.0)
+        monkeypatch.setattr(cache_module.time, "time", fake_time)
+        set_cache(FileCache(root=tmp_path / "cache", ttl_static=3600))
+        try:
+            route = respx.get(
+                "https://www.courtlistener.com/api/rest/v4/clusters/123/"
+            ).mock(return_value=httpx.Response(200, json=MOCK_CLUSTER_DETAIL_RESPONSE))
+
+            async with client:
+                await client.call_tool("get_cluster", {"cluster_id": "123"})
+                assert route.call_count == 1
+                await client.call_tool("get_cluster", {"cluster_id": "123"})
+                assert route.call_count == 1  # fresh entry: still cached
+
+                fake_time.now += 3601  # age > ttl → expired → fresh HTTP
+                await client.call_tool("get_cluster", {"cluster_id": "123"})
+                assert route.call_count == 2
+        finally:
+            set_cache(None)
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_ac_4_6_no_key_material_in_cache_after_flow(
+        self, client: Client[Any]
+    ) -> None:
+        """AC-4.6: end-to-end get flow writes cache files without auth material."""
+        from app.cache import get_cache as _get_cache
+
+        respx.get("https://www.courtlistener.com/api/rest/v4/clusters/123/").mock(
+            return_value=httpx.Response(200, json=MOCK_CLUSTER_DETAIL_RESPONSE)
+        )
+
+        async with client:
+            await client.call_tool("get_cluster", {"cluster_id": "123"})
+
+        for path in _get_cache().root.rglob("*.json"):
+            content = path.read_text(encoding="utf-8")
+            assert "test-key-offline-dummy" not in content
+            assert "Authorization" not in content
+            assert "Token " not in content
 
 
 class TestErrorHandling:
@@ -513,7 +920,7 @@ class TestGetTools:
     @pytest.mark.asyncio
     @respx.mock
     async def test_get_docket(self, client: Client[Any]) -> None:
-        """Test docket retrieval with mocked response."""
+        """Test docket retrieval returns the stripped FR-3.1 docket shape."""
         docket_response = {
             "id": 12345,
             "case_name": "Test Case",
@@ -529,8 +936,11 @@ class TestGetTools:
 
             assert not result.is_error
             data = result.data
-            assert data["id"] == 12345
-            assert data["case_name"] == "Test Case"
+            assert set(data.keys()) <= {"caseName", "docketNumber", "court", "dateFiled", "docket_id"}
+            assert data["docket_id"] == 12345
+            assert data["caseName"] == "Test Case"
+            assert data["docketNumber"] == "1:23-cv-00001"
+            assert data["court"] == "dcd"
 
     @pytest.mark.asyncio
     @respx.mock
@@ -556,7 +966,7 @@ class TestGetTools:
     @pytest.mark.asyncio
     @respx.mock
     async def test_get_cluster(self, client: Client[Any]) -> None:
-        """Test cluster retrieval with mocked response."""
+        """Test cluster retrieval returns the stripped FR-3.1 cluster shape."""
         cluster_response = {
             "id": 11111,
             "case_name": "Smith v. Jones",
@@ -572,7 +982,9 @@ class TestGetTools:
 
             assert not result.is_error
             data = result.data
-            assert data["id"] == 11111
+            assert set(data.keys()) <= {"caseName", "citations", "court", "dateFiled", "cluster_id", "docket_id"}
+            assert data["cluster_id"] == 11111
+            assert data["caseName"] == "Smith v. Jones"
 
     @pytest.mark.asyncio
     @respx.mock

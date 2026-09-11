@@ -6,18 +6,22 @@ citation lookup, citation format verification, parsing, extraction from text, an
 enhanced lookups combining citeurl and CourtListener data.
 """
 
+import re
 from functools import lru_cache
 from pathlib import Path
-import re
 from typing import Annotated, Any
 
-from citeurl import Citator, cite as citeurl_cite, list_cites  # type: ignore[import-untyped]
-from fastmcp import Context, FastMCP
 import httpx
+from citeurl import Citator, list_cites  # type: ignore[import-untyped]
+from citeurl import cite as citeurl_cite
+from fastmcp import Context, FastMCP
 from loguru import logger
 from pydantic import Field
 
+from app import fields
+from app.cache import get_cache, slugify_key
 from app.config import config, get_auth_headers, get_http_client
+from app.tools.get import cached_fetch
 
 # Create the citation server
 citation_server: FastMCP[Any] = FastMCP(
@@ -143,12 +147,24 @@ async def batch_lookup_citations(
             response.raise_for_status()
             data = response.json()
 
-        # Wrap list responses in a dict for MCP compatibility
+        # Wrap list responses in a dict for MCP compatibility, stripping each
+        # entry's candidate clusters to the FR-3.1 schema (D3) while keeping
+        # per-citation statuses, messages and counts verbatim.
         if isinstance(data, list):
+            stripped_results: list[dict[str, Any]] = []
+            for entry in data:
+                if isinstance(entry, dict):
+                    stripped_entry = dict(entry)
+                    stripped_entry["clusters"] = fields.strip_candidates(
+                        entry.get("clusters", [])
+                    )
+                    stripped_results.append(stripped_entry)
+                else:
+                    stripped_results.append(entry)
             result: dict[str, Any] = {
                 "citations_requested": citations,
-                "count": len(data),
-                "results": data,
+                "count": len(stripped_results),
+                "results": stripped_results,
             }
         else:
             result = data
@@ -162,6 +178,239 @@ async def batch_lookup_citations(
     except Exception as e:
         await ctx.error(f"Error in batch citation lookup: {e}")
         raise
+
+
+def _normalize_citation_for_lookup(citation: str) -> str:
+    """Optional citeurl pass (ADR-3 step 1): canonical text or the raw string."""
+    try:
+        citator = get_citator()
+        parsed = citeurl_cite(citation, broad=True, citator=citator)
+    except Exception:  # noqa: BLE001 - citeurl failure sends the raw string (ADR-3)
+        return citation
+    text = getattr(parsed, "text", None)
+    return str(text) if text else citation
+
+
+def _normalize_status(entry: dict[str, Any]) -> int:
+    """Per-citation status as int; unparseable values degrade to 0 (unknown)."""
+    status = entry.get("status")
+    if isinstance(status, int) and not isinstance(status, bool):
+        return status
+    if isinstance(status, str) and status.isdigit():
+        return int(status)
+    return 0
+
+
+def _sub_opinion_ids(raw_cluster: dict[str, Any]) -> list[str]:
+    """Sub-opinion IDs from a cluster detail record (``sub_opinions`` URLs)."""
+    ids: list[str] = []
+    for ref in raw_cluster.get("sub_opinions") or []:
+        resource_id = fields.resource_id_from_ref(ref)
+        if resource_id is not None:
+            ids.append(resource_id)
+    return ids
+
+
+async def _fetch_opinion_cached(ctx: Context, opinion_id: str) -> dict[str, Any]:
+    """Fetch (and cache) an opinion detail record by ID."""
+    return await cached_fetch(
+        ctx, "opinions", f"opinion-{opinion_id}", "opinion", opinion_id
+    )
+
+
+def _disposition_result(citation: str, status: int, entry: dict[str, Any]) -> dict[str, Any] | None:
+    """Map a non-200 per-citation status to its structured result (FR-1.2).
+
+    Returns None when the status permits proceeding (200). No status triggers
+    a retry or a search fallback (Non-goals).
+
+    """
+    error_message = entry.get("error_message") or ""
+    if status == 429:
+        return {
+            "citation": citation,
+            "status": 429,
+            "found": False,
+            "message": "CourtListener reported 429 (over cap) for this citation; surfaced without retry.",
+            "error_message": error_message,
+        }
+    if status == 404:
+        return {
+            "citation": citation,
+            "status": 404,
+            "found": False,
+            "message": "Citation is validly formatted but not found in the CourtListener corpus.",
+        }
+    if status == 400:
+        return {
+            "citation": citation,
+            "status": 400,
+            "found": False,
+            "message": f"Invalid citation or unknown reporter.{(' ' + error_message) if error_message else ''}",
+        }
+    if status == 300:
+        return {
+            "citation": citation,
+            "status": 300,
+            "found": False,
+            "message": "Ambiguous citation: multiple clusters match. Pick one and fetch it by cluster_id.",
+            "candidates": fields.strip_candidates(entry.get("clusters") or []),
+        }
+    if status != 200:
+        return {
+            "citation": citation,
+            "status": status,
+            "found": False,
+            "message": f"Unexpected citation-lookup status {status}.",
+        }
+    return None
+
+
+@citation_server.tool()
+async def resolve_citation(
+    citation: Annotated[
+        str,
+        Field(
+            description="The citation to resolve exactly (e.g., '410 U.S. 113', '123 F.3d 456')"
+        ),
+    ],
+    ctx: Context,
+    all_opinions: Annotated[
+        bool,
+        Field(
+            description="Fetch every sub-opinion's text instead of only the lead opinion"
+        ),
+    ] = False,
+) -> dict[str, Any]:
+    """Resolve an exact citation to its matched cluster and the opinion text (FR-1, ADR-3).
+
+    Flow: optional citeurl normalization → cached ``citations/`` mapping →
+    ``POST citation-lookup/`` → status dispatch (200/300/404/400/429 — no
+    retry, no search fallback) → cached cluster fetch → lead opinion text
+    (cached; all sub-opinions with ``all_opinions=true``).
+
+    Returns ``{citation, status, cluster: {caseName, citations, court,
+    dateFiled, cluster_id, docket_id}, opinionText}``. On ``300`` the result
+    carries stripped ``candidates`` instead of fetching anything. ``court`` may
+    require one extra cached docket fetch when the cluster omits it. Text
+    falls back plain_text → html_with_citations → html; if all are missing the
+    result carries a ``text_unavailable`` note instead of failing.
+
+    """
+    await ctx.info(f"Resolving citation: {citation}")
+    headers = get_auth_headers()
+
+    cache = get_cache()
+    slug = slugify_key(citation)
+
+    cached_entry = cache.get("citations", slug)
+    cluster_id = (
+        fields.resource_id_from_ref(cached_entry.get("cluster_id"))
+        if isinstance(cached_entry, dict)
+        else None
+    )
+    if cluster_id is not None:
+        await ctx.info(f"Cache hit (citations/{slug}) → cluster {cluster_id}")
+
+    if cluster_id is None:
+        normalized = _normalize_citation_for_lookup(citation)
+        async with get_http_client(ctx) as http_client:
+            response = await http_client.post(
+                f"{config.courtlistener_base_url}citation-lookup/",
+                headers=headers,
+                data={"text": normalized},
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        entries = data if isinstance(data, list) else [data]
+        entry = entries[0] if entries and isinstance(entries[0], dict) else {}
+        if not entry:
+            # Empty/missing lookup array: treat as valid-format-not-found (M4)
+            # instead of a misleading "status 0".
+            await ctx.info(f"Citation {citation} → no lookup entry (treated as not found)")
+            return {
+                "citation": citation,
+                "status": 404,
+                "found": False,
+                "message": "Citation-lookup returned no entry for this citation (not found in corpus).",
+            }
+        status = _normalize_status(entry)
+        disposition = _disposition_result(citation, status, entry)
+        if disposition is not None:
+            await ctx.info(f"Citation {citation} → status {status} (no follow-up fetch)")
+            return disposition
+
+        clusters = entry.get("clusters") or []
+        first_cluster = clusters[0] if clusters else None
+        cluster_id = (
+            fields.resource_id_from_ref(first_cluster.get("id"))
+            if isinstance(first_cluster, dict)
+            else None
+        )
+        if cluster_id is None:
+            return {
+                "citation": citation,
+                "status": status,
+                "found": False,
+                "message": "Citation-lookup returned a match without a usable cluster id.",
+            }
+        try:
+            cache.put("citations", slug, {"cluster_id": int(cluster_id)})
+        except OSError as e:  # unwritable cache dir must not fail the tool (NFR-6)
+            await ctx.warning(f"Cache write failed (citations/{slug}): {e}")
+
+    raw_cluster = await cached_fetch(
+        ctx, "clusters", f"cluster-{cluster_id}", "cluster", cluster_id
+    )
+    stripped = fields.strip_resource("cluster", raw_cluster)
+
+    if "court" not in stripped:
+        docket_id = stripped.get("docket_id")
+        if docket_id is not None:
+            raw_docket = await cached_fetch(
+                ctx, "dockets", f"docket-{docket_id}", "docket", str(docket_id)
+            )
+            court = fields.court_from_docket(raw_docket)
+            if court is not None:
+                stripped["court"] = court
+
+    sub_opinion_ids = _sub_opinion_ids(raw_cluster)
+    opinion_text: str | None = None
+    collected_opinions: list[dict[str, Any]] = []
+
+    lead_opinion_id = sub_opinion_ids[0] if sub_opinion_ids else None
+    if lead_opinion_id is not None:
+        lead_opinion_raw = await _fetch_opinion_cached(ctx, lead_opinion_id)
+        opinion_text = fields.extract_opinion_text(lead_opinion_raw)
+
+    if all_opinions:
+        for opinion_id in sub_opinion_ids:
+            raw_opinion = await _fetch_opinion_cached(ctx, opinion_id)
+            collected_opinions.append(
+                {
+                    "opinion_id": int(opinion_id) if opinion_id.isdigit() else opinion_id,
+                    "type": raw_opinion.get("type"),
+                    "text": fields.extract_opinion_text(raw_opinion),
+                }
+            )
+
+    result: dict[str, Any] = {
+        "citation": citation,
+        "status": 200,
+        "cluster": stripped,
+        "opinionText": opinion_text,
+    }
+    if all_opinions:
+        result["opinions"] = collected_opinions
+    if opinion_text is None and sub_opinion_ids:
+        result["note"] = "text_unavailable"
+        result["sub_opinions"] = [
+            int(oid) if oid.isdigit() else oid for oid in sub_opinion_ids
+        ]
+
+    await ctx.info(f"Resolved citation {citation} → cluster {cluster_id}")
+    return result
 
 
 @citation_server.tool()
@@ -256,7 +505,7 @@ async def verify_citation_format(
                 ],
             }
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - citeurl failure degrades to basic-pattern fallback
         # Fallback to basic validation if citeurl fails
         logger.warning(
             f"citeurl verification failed, falling back to basic patterns: {e}"
@@ -508,7 +757,7 @@ async def enhanced_citation_lookup(
                 "success": False,
                 "error": "Citation not recognized by citeurl",
             }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - parse errors become structured analysis results
         result["citeurl_analysis"] = {
             "success": False,
             "error": f"citeurl parsing error: {e}",
@@ -539,7 +788,7 @@ async def enhanced_citation_lookup(
                 "success": False,
                 "error": "COURT_LISTENER_API_KEY not found",
             }
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - API errors surface as structured tool data
             result["courtlistener_data"] = {
                 "success": False,
                 "error": f"CourtListener API error: {e}",

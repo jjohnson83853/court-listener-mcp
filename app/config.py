@@ -35,6 +35,12 @@ class Config(BaseSettings):
     courtlistener_api_key: str | None = None
     courtlistener_timeout: int = 30
 
+    # File cache (FR-4, ADR-2, D1): dir + per-class TTLs + total size cap
+    courtlistener_cache_dir: str = ".cache/court-listener/"
+    courtlistener_cache_ttl_static: int = 30 * 86400  # 30 days: citations/clusters/opinions
+    courtlistener_cache_ttl_dockets: int = 86400  # 24 hours: dockets (mutable)
+    courtlistener_cache_max_mb: int = 100  # total cap, oldest-first eviction
+
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",

@@ -2,8 +2,8 @@
 
 from typing import Any
 
-from fastmcp import Client
 import pytest
+from fastmcp import Client
 
 
 @pytest.mark.asyncio

@@ -1,12 +1,26 @@
-"""Search tools for CourtListener MCP server."""
+"""Search tools for CourtListener MCP server.
+
+Case-law searches (``opinions``/``dockets``/``dockets_with_documents``/
+``recap_documents``) send ``highlight=on`` (FR-2.3), strip each hit to the
+FR-2.1 allowlist and return a ``{count, results}`` envelope (ADR-5). ``audio``
+and ``people`` searches are unchanged raw pass-throughs (Non-goals).
+"""
 
 from typing import Annotated, Any
 
-from fastmcp import Context, FastMCP
 import httpx
+from fastmcp import Context, FastMCP
 from pydantic import Field
 
+from app import fields
 from app.config import config, get_auth_headers, get_http_client
+from app.query import parse_natural_query
+
+# Search types that support snippets → send highlight=on (FR-2.3).
+_SNIPPET_TYPES: frozenset[str] = frozenset({"o", "r", "rd"})
+# Search types whose hits are stripped to the FR-2.1 allowlist; other types
+# (oa, p, ...) stay raw pass-through (Non-goals).
+_STRIPPED_TYPES: frozenset[str] = frozenset({"o", "d", "r", "rd"})
 
 # Create the search server
 search_server: FastMCP[Any] = FastMCP(
@@ -58,6 +72,10 @@ async def _search_courtlistener(
         "type": search_type,
     }
 
+    # Snippet-capable types get highlighted snippets (FR-2.3); dockets (d) not.
+    if search_type in _SNIPPET_TYPES:
+        params["highlight"] = "on"
+
     # Add limit (V4 uses 'hit' instead of 'limit')
     if limit:
         params["hit"] = limit
@@ -76,6 +94,15 @@ async def _search_courtlistener(
             )
             response.raise_for_status()
             data = response.json()
+
+        if search_type in _STRIPPED_TYPES and isinstance(data, dict):
+            hits = [hit for hit in (data.get("results") or []) if isinstance(hit, dict)]
+            stripped_results = [fields.strip_search_hit(hit, search_type) for hit in hits]
+            await ctx.info(f"Found {data.get('count', 0)} {resource_type}")
+            return {
+                "count": data.get("count", len(hits)),
+                "results": stripped_results,
+            }
 
         await ctx.info(f"Found {data.get('count', 0)} {resource_type}")
         return data
@@ -114,10 +141,19 @@ async def opinions(
         Field(description="Sort by 'score desc', 'dateFiled desc', or 'dateFiled asc'"),
     ] = "score desc",
     limit: Annotated[
-        int, Field(description="Maximum results to return", ge=1, le=100)
-    ] = 20,
+        int, Field(description="Maximum results to return (1-50)", ge=1, le=50)
+    ] = 10,
 ) -> dict[str, Any]:
-    """Search case law opinion clusters with nested Opinion documents in CourtListener."""
+    """Search case law opinion clusters with nested Opinion documents in CourtListener.
+
+    Typed parameters beat stuffing everything into q. Worked examples:
+    - q="miranda warning", court="scotus", filed_after="1960-01-01",
+      filed_before="1970-12-31", limit=10
+    - q="seaman status", judge="Alito", cited_gt=50, limit=10
+
+    Hits are stripped to caseName/citations/court/dateFiled/cluster_id/docket_id
+    plus a snippet; use cluster_id with get_cluster/get_opinion for full text.
+    """
     return await _search_courtlistener(
         ctx=ctx,
         resource_type="opinions",
@@ -160,10 +196,19 @@ async def dockets(
         Field(description="Sort by 'score desc', 'dateFiled desc', or 'dateFiled asc'"),
     ] = "score desc",
     limit: Annotated[
-        int, Field(description="Maximum results to return", ge=1, le=100)
-    ] = 20,
+        int, Field(description="Maximum results to return (1-50)", ge=1, le=50)
+    ] = 10,
 ) -> dict[str, Any]:
-    """Search federal cases (dockets) from PACER in CourtListener."""
+    """Search federal cases (dockets) from PACER in CourtListener.
+
+    Typed parameters beat stuffing everything into q. Worked examples:
+    - q="patent infringement", court="cafc", docket_number="23-1234", limit=10
+    - q="", case_name="Roe", date_filed_after="1970-01-01",
+      date_filed_before="1973-12-31", party_name="Wade"
+
+    Docket hits (type d) carry no snippets; results are stripped to
+    caseName/docketNumber/court/dateFiled/docket_id.
+    """
     return await _search_courtlistener(
         ctx=ctx,
         resource_type="dockets",
@@ -205,12 +250,18 @@ async def dockets_with_documents(
         Field(description="Sort by 'score desc', 'dateFiled desc', or 'dateFiled asc'"),
     ] = "score desc",
     limit: Annotated[
-        int, Field(description="Maximum results to return", ge=1, le=100)
-    ] = 20,
+        int, Field(description="Maximum results to return (1-50)", ge=1, le=50)
+    ] = 10,
 ) -> dict[str, Any]:
     """Search federal cases (dockets) with up to three nested documents.
 
     If there are more than three matching documents, the more_docs field will be true.
+
+    Typed parameters beat stuffing everything into q. Worked examples:
+    - q="summary judgment", court="ca9", date_filed_after="2022-01-01", limit=10
+    - q="", party_name="Acme Corp", docket_number="1:23-cv-00001"
+
+    Hits are stripped (type r) and carry top-level snippets (highlight=on is sent).
     """
     return await _search_courtlistener(
         ctx=ctx,
@@ -259,10 +310,18 @@ async def recap_documents(
         Field(description="Sort by 'score desc', 'dateFiled desc', or 'dateFiled asc'"),
     ] = "score desc",
     limit: Annotated[
-        int, Field(description="Maximum results to return", ge=1, le=100)
-    ] = 20,
+        int, Field(description="Maximum results to return (1-50)", ge=1, le=50)
+    ] = 10,
 ) -> dict[str, Any]:
-    """Search federal filing documents from PACER in the RECAP archive."""
+    """Search federal filing documents from PACER in the RECAP archive.
+
+    Typed parameters beat stuffing everything into q. Worked examples:
+    - q="motion to dismiss", court="nysd", document_number="15",
+      filed_after="2023-01-01", limit=10
+    - q="", case_name="Roe", attachment_number="2", party_name="Wade"
+
+    Hits are stripped (type rd) and carry top-level snippets (highlight=on is sent).
+    """
     return await _search_courtlistener(
         ctx=ctx,
         resource_type="RECAP documents",
@@ -281,6 +340,62 @@ async def recap_documents(
             "party_name": party_name,
         },
     )
+
+
+@search_server.tool()
+async def natural_language(
+    query: Annotated[
+        str,
+        Field(
+            description=(
+                "Free-text case question, e.g. 'SCOTUS, qualified immunity, after 2015' "
+                "or 'ninth circuit \"official capacity\" before 2020'. Interpreted "
+                "deterministically: court aliases, date phrases, quoted phrases, "
+                "judge/case hints; everything else stays in q."
+            )
+        ),
+    ],
+    ctx: Context,
+    limit: Annotated[
+        int, Field(description="Maximum results to return (1-50)", ge=1, le=50)
+    ] = 10,
+) -> dict[str, Any]:
+    """Search opinions from a natural-language question (FR-5, ADR-6).
+
+    Deterministic (no LLM, no network for the interpretation): maps court
+    aliases ("supreme court" → scotus, "ninth circuit" → ca9), date phrases
+    ("after 2015" → 2015-01-01), quoted phrases, and judge/case hints onto the
+    typed parameters of the opinions search; anything unmapped stays in ``q``.
+
+    Returns ``{interpreted_query, count, results}`` — check
+    ``interpreted_query`` to see (and correct) the interpretation.
+
+    Worked examples:
+    - query="SCOTUS, qualified immunity, after 2015"
+    - query='ninth circuit "official capacity" before 2020'
+    - query="judge Kagan, case Miranda, since 2015-06"
+
+    """
+    parsed = parse_natural_query(query)
+    interpreted = parsed.params()
+    await ctx.info(f"Natural-language query interpreted as: {interpreted}")
+
+    stripped_search = await _search_courtlistener(
+        ctx=ctx,
+        resource_type="opinions",
+        search_type="o",
+        q=interpreted.get("q", ""),
+        order_by="score desc",
+        limit=limit,
+        filters={
+            "court": interpreted.get("court", ""),
+            "case_name": interpreted.get("case_name", ""),
+            "judge": interpreted.get("judge", ""),
+            "filed_after": interpreted.get("filed_after", ""),
+            "filed_before": interpreted.get("filed_before", ""),
+        },
+    )
+    return {"interpreted_query": interpreted, **stripped_search}
 
 
 @search_server.tool()
@@ -308,7 +423,12 @@ async def audio(
         int, Field(description="Maximum results to return", ge=1, le=100)
     ] = 20,
 ) -> dict[str, Any]:
-    """Search oral argument audio recordings in CourtListener."""
+    """Search oral argument audio recordings in CourtListener.
+
+    Typed parameters beat stuffing everything into q. Worked examples:
+    - q="qualified immunity", court="scotus", argued_after="2022-10-01", limit=10
+    - q="", case_name="Moore", judge="Roberts", argued_before="2023-06-30"
+    """
     return await _search_courtlistener(
         ctx=ctx,
         resource_type="audio recordings",
@@ -353,7 +473,12 @@ async def people(
         int, Field(description="Maximum results to return", ge=1, le=100)
     ] = 20,
 ) -> dict[str, Any]:
-    """Search judges and legal professionals in the CourtListener database."""
+    """Search judges and legal professionals in the CourtListener database.
+
+    Typed parameters beat stuffing everything into q. Worked examples:
+    - q="Roberts", position_type="jud", limit=10
+    - q="", name="Sonia Sotomayor", appointed_by="Obama", school="Princeton"
+    """
     return await _search_courtlistener(
         ctx=ctx,
         resource_type="people",

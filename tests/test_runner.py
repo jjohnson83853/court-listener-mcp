@@ -1,8 +1,8 @@
 """Test runner for CourtListener MCP server tests."""
 
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 from loguru import logger
 

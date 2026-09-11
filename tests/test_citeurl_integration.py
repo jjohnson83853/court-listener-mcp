@@ -1,8 +1,8 @@
 """Test citeurl integration with CourtListener MCP server."""
 
+import pytest
 from citeurl import Citator, cite, list_cites  # type: ignore[import-untyped]
 from loguru import logger
-import pytest
 
 
 def test_citeurl_basic_functionality() -> None:
@@ -68,7 +68,7 @@ def test_various_citation_formats() -> None:
             if parsed:
                 assert isinstance(parsed.text, str)
                 assert isinstance(parsed.tokens, dict)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - any citeurl crash is a test failure
             pytest.fail(f"citeurl failed on citation '{citation_text}': {e}")
 
 

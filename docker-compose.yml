@@ -1,10 +1,9 @@
 services:
   # Production service - HTTP transport for network access
+  # NOTE: HOST-side ./.data/cache must be owned by the container's non-root UID
+  # (chown 1000:1000 ./.data/cache) before first start, or cache chmod 0700/0600 will fail.
   court-listener-mcp:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: court-listener-mcp:latest
+    image: registry.localdomain:5000/court-listener-mcp:0.2.0
     container_name: court-listener-mcp-server
     command: python -m app
     ports:
@@ -13,6 +12,8 @@ services:
       - .env
     environment:
       - COURTLISTENER_LOG_LEVEL=INFO
+    volumes:
+      - ./.data/cache:/app/.cache
     restart: unless-stopped
     networks:
       - mcp-network
